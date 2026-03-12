@@ -64,7 +64,7 @@ class BalanceSceneCfg(InteractiveSceneCfg):
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=False,
                 solver_position_iteration_count=4,
-                solver_velocity_iteration_count=0,
+                solver_velocity_iteration_count=1,
                 fix_root_link=False,        # 부유 로봇 (밸런스 필요)
             ),
         ),
@@ -105,8 +105,8 @@ class BalanceControllerConfig:
     tau_limit_nm: float = 15.0
 
     # Outer loop (위치 PD): r_cmd -> theta_cmd
-    kp_pos: float = 0.5
-    kd_pos: float = 0.1
+    kp_pos: float = 0.03
+    kd_pos: float = 0.05
     theta_cmd_limit_rad: float = math.radians(15.0)
     pitch_trim_rad: float = math.radians(3.70)
 
