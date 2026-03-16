@@ -1,24 +1,3 @@
-"""
-Wheeled Inverted Pendulum – Cascade PD Balance Controller (Isaac Lab Simulation)
-
-GOAT_PD_Ctrl_WIP.m 포팅
-
-제어 구조 (MATLAB과 동일한 2중 루프 캐스케이드 PD):
-    Outer loop (위치 제어): phi_cmd → theta_cmd
-        theta_cmd = Kp_phi * (phi_cmd - phi) + Kd_phi * (0 - phi_dot)
-
-    Inner loop (자세 제어): theta_cmd → tau
-        tau = Kp_theta * (theta - theta_cmd) + Kd_theta * theta_dot
-
-상태 변수:
-    phi       : 바퀴 회전각 평균 [rad]          (wheel_L/R joint pos 평균)
-    theta     : 본체 피치각, 수직 기준 0 [rad]   (root quaternion → pitch)
-    phi_dot   : 바퀴 각속도 평균 [rad/s]
-    theta_dot : 본체 피치 각속도 [rad/s]         (root_ang_vel_w y축)
-
-비바퀴 관절 (hip/thigh/knee): 초기 위치 PD 고정
-"""
-
 import argparse
 import math
 import torch
@@ -44,8 +23,9 @@ from isaaclab.utils.math import euler_xyz_from_quat
 from dataclasses import field
 from lib.env.GOAT_base_env_cfg import GOAT_Cfg
 
-
-# ── Scene 설정  (fix_root_link=False, 중력 ON) ────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Scene 설정  (fix_root_link=False, 중력 ON)
+# ─────────────────────────────────────────────────────────────────────────────
 @configclass
 class BalanceSceneCfg(InteractiveSceneCfg):
     ground = AssetBaseCfg(
@@ -64,7 +44,7 @@ class BalanceSceneCfg(InteractiveSceneCfg):
                 enabled_self_collisions=False,
                 solver_position_iteration_count=4,
                 solver_velocity_iteration_count=1,
-                fix_root_link=False
+                fix_root_link=False,        # 부유 로봇 (밸런스 필요)
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
@@ -95,42 +75,58 @@ class BalanceSceneCfg(InteractiveSceneCfg):
 @configclass
 class BalanceControllerConfig:
     """캐스케이드 PD 밸런스 컨트롤러 설정."""
-    # 로봇 지오메트리
+    # 로봇 지오메트리   
     wheel_radius: float = 72.75e-3
 
     # Inner loop (자세 PD): theta_cmd -> wheel_tau
-    kp_att: float    = 10.0
-    kd_att: float    = 5.0
-    tau_limit: float = 4.5 # [Nm]
+    kp_att: float    = 30.0
+    kd_att: float    = 4.0
+    tau_limit: float = 4.5
 
-    # Outer loop (위치 PD): phi_des -> theta_cmd
-    kp_pos: float          = 0.0
-    kd_pos: float          = 0.0
-    theta_cmd_limit: float = math.radians(15.0)
-    pitch_trim: float      = math.radians(0)
+    # Outer loop (위치 PD): r_cmd -> theta_cmd
+    kp_pos: float          = 1.0
+    kd_pos: float          = 0.4
+    theta_cmd_limit: float = math.radians(5.0)
+    pitch_trim: float      = math.radians(0.0) 
 
+    # 다리 관절 위치 고정 PD
+    leg_kp: float        = 30.0
+    leg_kd: float        = 2.0
+    leg_tau_limit: float = 10.0
 
-    # 관절 인덱스 (총 8개 관절 중 바퀴는 마지막 6, 7번)
+    # 관절 인덱스
+    leg_indices: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5])
     wheel_indices: list[int] = field(default_factory=lambda: [6, 7])
 
 
 class BalancePDController:
-    """
-    캐스케이드 PD 밸런스 컨트롤러 로직을 클래스로 캡슐화.
-    모든 연산은 torch를 사용하여 GPU에서 효율적으로 수행됩니다.
-    """
 
     def __init__(self, cfg: BalanceControllerConfig, num_envs: int, device: str):
-        self.cfg = cfg
-        self.num_envs = num_envs
-        self.device = device
+        self.cfg        = cfg
+        self.num_envs   = num_envs
+        self.device     = device
+        self.num_joints = len(cfg.leg_indices) + len(cfg.wheel_indices)
 
         # 인덱스를 텐서로 변환하여 GPU에서 효율적인 슬라이싱 가능하도록 함
+        self.leg_indices   = torch.tensor(cfg.leg_indices, device=device, dtype=torch.long)
         self.wheel_indices = torch.tensor(cfg.wheel_indices, device=device, dtype=torch.long)
 
-    def _position_control(self, phi: torch.Tensor, phi_dot: torch.Tensor, target_phi: torch.Tensor) -> torch.Tensor:
-        phi_err = target_phi - phi
-        theta_cmd = self.cfg.kp_pos * phi_err + self.cfg.kd_pos * (0- phi_dot)
+    def _COM_angle_cal(self, body_pos: torch.Tensor, body_lin_vel: torch.Tensor, link_mass: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        link_mass_expanded   = link_mass[:, 0:7].unsqueeze(-1)
+        com                  = torch.sum(body_pos[:, 0:7, :]*link_mass_expanded, dim=1) / torch.sum(link_mass_expanded, dim=1)
+        com_lin_vel          = torch.sum(body_lin_vel[:, 0:7, :]*link_mass_expanded, dim=1) / torch.sum(link_mass_expanded, dim=1)
+        wheel_center         = torch.sum(body_pos[:, 7:9, :], dim=1)/2
+        wheel_center_lin_vel = torch.sum(body_lin_vel[:, 7:9, :], dim=1)/2
+        com_rel              = com - wheel_center
+        com_rel_lin_vel      = com_lin_vel - wheel_center_lin_vel
+        theta                = torch.atan2(com_rel[:, 0], com_rel[:, 2])
+        theta_dot            = (com_rel_lin_vel[:, 0]*com_rel[:, 2] - com_rel_lin_vel[:, 2]*com_rel[:, 0])/((com_rel[:, 0])**2 + (com_rel[:, 2])**2+ 1e-6)
+        return theta, theta_dot
+
+
+    def _position_control(self, r: torch.Tensor, r_dot: torch.Tensor, target_r: torch.Tensor) -> torch.Tensor:
+        r_err = target_r - r
+        theta_cmd = self.cfg.kp_pos * r_err + self.cfg.kd_pos * (0- r_dot)
         return torch.clamp(theta_cmd, -self.cfg.theta_cmd_limit, self.cfg.theta_cmd_limit)
 
     def _attitude_control(self, theta: torch.Tensor, theta_dot: torch.Tensor, theta_cmd: torch.Tensor) -> torch.Tensor:
@@ -138,49 +134,58 @@ class BalancePDController:
         tau = self.cfg.kp_att * theta_err + self.cfg.kd_att * theta_dot
         return torch.clamp(tau, -self.cfg.tau_limit, self.cfg.tau_limit)
 
+    def _leg_position_hold(self, joint_pos: torch.Tensor, joint_vel: torch.Tensor, target_pos: torch.Tensor) -> torch.Tensor:
+        pos = joint_pos[:, self.leg_indices]
+        vel = joint_vel[:, self.leg_indices]
+        tgt = target_pos[:, self.leg_indices]
+        tau = self.cfg.leg_kp * (tgt - pos) + self.cfg.leg_kd * (0.0 - vel)
+        return torch.clamp(tau, -self.cfg.leg_tau_limit, self.cfg.leg_tau_limit)
+
     def compute_torque(
         self,
         joint_pos: torch.Tensor,
         joint_vel: torch.Tensor,
-        root_quat_w: torch.Tensor,
-        root_ang_vel_w: torch.Tensor,
+        body_pos: torch.Tensor,
+        body_lin_vel: torch.Tensor,
+        link_mass: torch.Tensor,
+        target_leg_pos: torch.Tensor,
+        r: torch.Tensor,
+        r_dot: torch.Tensor,
+        target_r: torch.Tensor,
         target_phi: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
-        """
-        로봇 상태를 입력받아 모든 관절에 대한 최종 토크 명령을 계산합니다.
 
-        Returns:
-            - torque (torch.Tensor): [num_envs, 8] 크기의 최종 토크 벡터.
-            - debug_states (dict): 로깅 및 분석을 위한 중간 상태 변수 딕셔너리.
-        """
         # 1. 상태 변수 추출 (MATLAB 변수명과 대응)
-        # phi, phi_dot, 오른쪽 바퀴만 트랙킹
-        phi     = (joint_pos[:, self.wheel_indices[0]]-joint_pos[:, self.wheel_indices[1]])/2
-        phi_dot = (joint_vel[:, self.wheel_indices[0]]-joint_vel[:, self.wheel_indices[1]])/2
-        print("pos ", joint_pos[:, self.wheel_indices[0]],joint_pos[:, self.wheel_indices[1]])
-        print("vel ", joint_vel[:, self.wheel_indices[0]],joint_vel[:, self.wheel_indices[1]])
-        # theta, theta_dot: 본체 피치
-        _, theta, _ = euler_xyz_from_quat(root_quat_w)
-        theta_dot = root_ang_vel_w[:, 1]  # y축이 피치 회전축
+        phi     = (joint_pos[:, self.wheel_indices[0]] - joint_pos[:, self.wheel_indices[1]]) / 2.0
+        phi_dot = (joint_vel[:, self.wheel_indices[0]] - joint_vel[:, self.wheel_indices[1]]) / 2.0
+        theta, theta_dot = self._COM_angle_cal(body_pos, body_lin_vel, link_mass)
 
         # 2. 캐스케이드 PD 제어
-        theta_cmd = self._position_control(phi, phi_dot, target_phi)       # Outer loop
+        theta_cmd = self._position_control(r, r_dot, target_r)       # Outer loop
         wheel_tau = self._attitude_control(theta, theta_dot, theta_cmd)  # Inner loop
 
-        # 3. 전체 토크 벡터 조립 (효율적인 텐서 연산 사용)
-        torque                           = torch.zeros_like(joint_pos)
-        torque[:, self.wheel_indices[0]] = wheel_tau  # 왼쪽 바퀴
+        # 3. 다리 관절 위치 고정
+        leg_tau = self._leg_position_hold(joint_pos, joint_vel, target_leg_pos)
+
+        # 4. 전체 토크 벡터 조립
+        torque = torch.zeros(self.num_envs, self.num_joints, device=self.device)
+        torque[:, self.leg_indices] = leg_tau         # 다리 토크 할당
+        torque[:, self.wheel_indices[0]] = wheel_tau # 왼쪽 바퀴
         torque[:, self.wheel_indices[1]] = -wheel_tau  # 오른쪽 바퀴
 
-        # 4. 로깅을 위한 중간값 반환
+
+
+        # 5. 로깅을 위한 중간값 반환
+        phi = (joint_pos[:, self.wheel_indices[0]] - joint_pos[:, self.wheel_indices[1]]) / 2.0
         debug_states = {
+            "r": r,
+            "r_dot": r_dot,
             "phi": phi,
             "phi_dot": phi_dot,
             "theta": theta,
             "theta_dot": theta_dot,
             "wheel_tau": wheel_tau,
         }
-        #print (torque, debug_states)
         return torque, debug_states
 
 
@@ -201,10 +206,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
     # 초기 관절 상태 저장 (다리 고정 목표)
     robot.update(sim_dt)
-    default_joint_pos = robot.data.default_joint_pos.clone()   # [n_envs, 8]
-    default_joint_vel = robot.data.default_joint_vel.clone()   # [n_envs, 8]
-    default_root_state = robot.data.default_root_state.clone()
-    default_root_state[:, :3] += scene.env_origins
+    default_joint_pos = robot.data.default_joint_pos.clone().to(device)   # [n_envs, 8]
+    default_joint_vel = robot.data.default_joint_vel.clone().to(device)   # [n_envs, 8]
+    default_root_state = robot.data.default_root_state.clone().to(device)
+    link_mass = robot.data.default_mass.clone().to(device)
     n_joint = robot.num_joints
 
     zero_torque = torch.zeros(n_envs, n_joint, device=device)
@@ -217,44 +222,19 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     robot.reset()
     robot.update(sim_dt)
 
-    # ── Isaac Lab API를 사용한 관절 하드 락(Hard Lock) ────────────────────────
-    # 관절 한계(Limits)의 상한과 하한을 원하는 초기 각도로 동일하게 설정하여 물리엔진 레벨에서 고정시킵니다.
-    hip_ids, _ = robot.find_joints("hip_.*")
-    thigh_L_id, _ = robot.find_joints("thigh_L_Joint")
-    thigh_R_id, _ = robot.find_joints("thigh_R_Joint")
-    knee_L_id, _ = robot.find_joints("knee_L_Joint")
-    knee_R_id, _ = robot.find_joints("knee_R_Joint")
-
-    # Hip 고정 (0.0 rad)
-    robot.write_joint_position_limit_to_sim(
-        torch.tensor([[[0.0, 0.0]] * len(hip_ids)], device=device), joint_ids=hip_ids
-    )
-    # Thigh 고정
-    robot.write_joint_position_limit_to_sim(
-        torch.tensor([[[0.7382743, 0.7382743]]], device=device).expand(n_envs, -1, -1), joint_ids=thigh_L_id
-    )
-    robot.write_joint_position_limit_to_sim(
-        torch.tensor([[[-0.7382743, -0.7382743]]], device=device).expand(n_envs, -1, -1), joint_ids=thigh_R_id
-    )
-    # Knee 고정
-    robot.write_joint_position_limit_to_sim(
-        torch.tensor([[[1.46260337, 1.46260337]]], device=device).expand(n_envs, -1, -1), joint_ids=knee_L_id
-    )
-    robot.write_joint_position_limit_to_sim(
-        torch.tensor([[[-1.46260337, -1.46260337]]], device=device).expand(n_envs, -1, -1), joint_ids=knee_R_id
-    )
-    # ───────────────────────────────────────────────────────────────────
-
     # 로깅
     log_t         = []
+    log_r         = []
     log_phi       = []   # 바퀴 회전각 (평균) [rad]
     log_theta     = []   # 본체 피치각 [rad]
+    log_r_dot     = []
     log_phi_dot   = []
     log_theta_dot = []
     log_tau       = []   # 바퀴 토크 [Nm]
 
     t = 0.0
-    target_phi = torch.zeros(n_envs, device=device) # 목표 각도
+    target_r   = torch.zeros(n_envs, device=device) # 목표 위치
+    target_phi = torch.zeros(n_envs, device=device) # 목표 바퀴 회전각
 
     print("[INFO] Balance control started.")
 
@@ -264,8 +244,13 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         torque, debug_states = controller.compute_torque(
             joint_pos=robot.data.joint_pos,
             joint_vel=robot.data.joint_vel,
-            root_quat_w=robot.data.root_quat_w,
-            root_ang_vel_w=robot.data.root_ang_vel_w,
+            body_pos=robot.data.body_com_pos_w,        
+            body_lin_vel=robot.data.body_lin_vel_w, 
+            link_mass=link_mass,   
+            target_leg_pos=default_joint_pos,
+            r=(robot.data.body_com_pos_w[:, 7, 0]+robot.data.body_com_pos_w[:, 8, 0])/2,
+            r_dot=(robot.data.body_lin_vel_w[:, 7, 0]+robot.data.body_lin_vel_w[:, 8, 0])/2,
+            target_r=target_r,
             target_phi=target_phi,
         )
 
@@ -280,9 +265,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
         # ── 로그 ───────────────────────────────────────────────────────────
         log_t.append(t)
+        log_r.append(debug_states["r"][0].item())
         log_phi.append(debug_states["phi"][0].item())
         log_theta.append(debug_states["theta"][0].item())
-        log_phi_dot.append(debug_states["phi_dot"][0].item())
+        log_r_dot.append(debug_states["r_dot"][0].item())
+        log_phi_dot.append(debug_states["phi_dot"][0].item()) 
         log_theta_dot.append(debug_states["theta_dot"][0].item())
         log_tau.append(debug_states["wheel_tau"][0].item())
 
@@ -298,8 +285,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     fig, axes = plt.subplots(2, 3, figsize=(14, 7))
     fig.suptitle("Cascade PD Balance Controller – Simulation", fontsize=13)
 
-    axes[0, 0].plot(t_arr, np.degrees(np.array(log_phi))*cfg.wheel_radius)
-    axes[0, 0].axhline(float(target_phi)*cfg.wheel_radius, color='r', ls='--', label='r [m]')
+    axes[0, 0].plot(t_arr, np.array(log_r), label='r')
+    axes[0, 0].axhline(float(target_r[0]), color='r', ls='--', label='r_cmd')
     axes[0, 0].set_title('Position  r [m]')
     axes[0, 0].set_xlabel('t [s]'); axes[0, 0].set_ylabel('r [m]')
     axes[0, 0].grid(True); axes[0, 0].legend()
@@ -311,14 +298,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     axes[0, 1].grid(True); axes[0, 1].legend()
 
     axes[0, 2].plot(t_arr, np.degrees(np.array(log_phi)))
-    axes[0, 2].axhline(math.degrees(float(target_phi)), color='r', ls='--', label='phi_des')
+    axes[0, 2].axhline(math.degrees(float(target_phi[0])), color='r', ls='--', label='phi_des')
     axes[0, 2].set_title('Wheel Angle  φ [deg]')
     axes[0, 2].set_xlabel('t [s]'); axes[0, 2].set_ylabel('φ [deg]')
     axes[0, 2].grid(True); axes[0, 2].legend()
 
-    axes[1, 0].plot(t_arr, np.array(log_phi_dot) * cfg.wheel_radius)
-    axes[1, 0].set_title('Velocity  ṙ [deg/s]')
-    axes[1, 0].set_xlabel('t [s]'); axes[1, 0].set_ylabel('ṙ [deg/s]')
+    axes[1, 0].plot(t_arr, np.array(log_r_dot))
+    axes[1, 0].set_title('Velocity  ṙ [m/s]')
+    axes[1, 0].set_xlabel('t [s]'); axes[1, 0].set_ylabel('ṙ [m/s]')
     axes[1, 0].grid(True)
 
     axes[1, 1].plot(t_arr, np.degrees(np.array(log_theta_dot)))
@@ -339,7 +326,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    sim_cfg = sim_utils.SimulationCfg(dt=0.005, device=args_cli.device)
+    sim_cfg = sim_utils.SimulationCfg(dt=0.002, device=args_cli.device)
     sim     = sim_utils.SimulationContext(sim_cfg)
     sim.set_camera_view([2.0, 1.5, 1.5], [0.0, 0.0, 0.3])
 
@@ -354,3 +341,6 @@ def main():
 if __name__ == "__main__":
     main()
     simulation_app.close()
+
+
+    
