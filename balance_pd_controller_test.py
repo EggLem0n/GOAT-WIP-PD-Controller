@@ -103,26 +103,142 @@ class BalanceControllerConfig:
 class BalancePDController:
 
     def __init__(self, cfg: BalanceControllerConfig, num_envs: int, device: str):
-        self.cfg        = cfg
-        self.num_envs   = num_envs
-        self.device     = device
-        self.num_joints = len(cfg.leg_indices) + len(cfg.wheel_indices)
-
-        # 인덱스를 텐서로 변환하여 GPU에서 효율적인 슬라이싱 가능하도록 함
+        self.cfg           = cfg
+        self.num_envs      = num_envs
+        self.device        = device
+        self.num_joints    = len(cfg.leg_indices) + len(cfg.wheel_indices)
         self.leg_indices   = torch.tensor(cfg.leg_indices, device=device, dtype=torch.long)
         self.wheel_indices = torch.tensor(cfg.wheel_indices, device=device, dtype=torch.long)
+        self.initial_phi    = None
 
-    def _COM_angle_cal(self, body_pos: torch.Tensor, body_lin_vel: torch.Tensor, link_mass: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        link_mass_expanded   = link_mass[:, 0:7].unsqueeze(-1)
-        com                  = torch.sum(body_pos[:, 0:7, :]*link_mass_expanded, dim=1) / torch.sum(link_mass_expanded, dim=1)
-        com_lin_vel          = torch.sum(body_lin_vel[:, 0:7, :]*link_mass_expanded, dim=1) / torch.sum(link_mass_expanded, dim=1)
-        wheel_center         = torch.sum(body_pos[:, 7:9, :], dim=1)/2
-        wheel_center_lin_vel = torch.sum(body_lin_vel[:, 7:9, :], dim=1)/2
-        com_rel              = com - wheel_center
-        com_rel_lin_vel      = com_lin_vel - wheel_center_lin_vel
-        theta                = torch.atan2(com_rel[:, 0], com_rel[:, 2])
-        theta_dot            = (com_rel_lin_vel[:, 0]*com_rel[:, 2] - com_rel_lin_vel[:, 2]*com_rel[:, 0])/((com_rel[:, 0])**2 + (com_rel[:, 2])**2+ 1e-6)
-        L                    = torch.sqrt(com_rel[:, 0]**2 + com_rel[:, 2]**2)
+        def vec(x, y, z): return torch.tensor([x, y, z], device=device, dtype=torch.float32).unsqueeze(0).repeat(num_envs, 1)
+
+        self.m_base = 3.075;   self.c_base = vec(-9.521e-3, 0.016e-3, -72.346e-3)
+            
+        self.m_hip = 0.316
+        self.p_hip_L = vec(38.386e-3, 94.233e-3, -152.597e-3);  self.c_hip_L = vec(-48.092e-3, -38.296e-3, -0.162e-3)
+        self.p_hip_R = vec(38.386e-3, -94.233e-3, -152.597e-3); self.c_hip_R = vec(-48.092e-3, 38.296e-3, -0.162e-3)
+        
+        self.m_thigh = 0.473
+        self.p_thigh_L = vec(-54e-3, -17e-3, 0.0);  self.c_thigh_L = vec(-2.292e-3, 44.134e-3, -32.074e-3)
+        self.p_thigh_R = vec(-54e-3, 17e-3, 0.0);   self.c_thigh_R = vec(-2.292e-3, -44.134e-3, -32.074e-3)
+        
+        self.m_calf = 0.321
+        self.p_calf_L = vec(0.0, 18e-3, -205e-3);   self.c_calf_L = vec(1.922e-3, 0.564e-3, -169.664e-3)
+        self.p_calf_R = vec(0.0, -18e-3, -205e-3);  self.c_calf_R = vec(1.922e-3, -0.564e-3, -169.664e-3)
+        
+        self.p_wheel_L = vec(0.0, 16.555e-3, -200e-3)
+        self.p_wheel_R = vec(0.0, -16.555e-3, -200e-3)
+            
+        self.M_total = self.m_base + 2*(self.m_hip + self.m_thigh + self.m_calf)
+    
+
+    def _COM_angle_cal_FK(self, root_pos, root_quat, root_lin_vel, root_ang_vel, q, dq):
+        """오직 IMU와 엔코더 정보만으로 실시간 CoM, 속도, 각도를 도출하는 정방향 기구학 엔진"""
+        N = self.num_envs
+        
+        # 1. 쿼터니언 -> 회전 행렬 (Base)
+        w, x, y, z = root_quat[:, 0], root_quat[:, 1], root_quat[:, 2], root_quat[:, 3]
+        R_base = torch.zeros((N, 3, 3), device=self.device)
+        R_base[:, 0, 0] = 1 - 2*(y**2 + z**2); R_base[:, 0, 1] = 2*(x*y - z*w);   R_base[:, 0, 2] = 2*(x*z + y*w)
+        R_base[:, 1, 0] = 2*(x*y + z*w);       R_base[:, 1, 1] = 1 - 2*(x**2 + z**2); R_base[:, 1, 2] = 2*(y*z - x*w)
+        R_base[:, 2, 0] = 2*(x*z - y*w);       R_base[:, 2, 1] = 2*(y*z + x*w);       R_base[:, 2, 2] = 1 - 2*(x**2 + y**2)
+
+        P_base = root_pos
+        V_base = root_lin_vel
+        W_base = root_ang_vel
+
+        # 벡터 및 회전 연산 도구
+        def cross(w, r): return torch.cross(w, r, dim=1)
+        def transf(R, v): return torch.bmm(R, v.unsqueeze(-1)).squeeze(-1)
+        def rot_x(ang, sign):
+            R = torch.eye(3, device=self.device).unsqueeze(0).repeat(N, 1, 1)
+            c = torch.cos(ang * sign); s = torch.sin(ang * sign)
+            R[:, 1, 1] = c; R[:, 1, 2] = -s; R[:, 2, 1] = s; R[:, 2, 2] = c
+            return R
+        def rot_y(ang, sign):
+            R = torch.eye(3, device=self.device).unsqueeze(0).repeat(N, 1, 1)
+            c = torch.cos(ang * sign); s = torch.sin(ang * sign)
+            R[:, 0, 0] = c; R[:, 0, 2] = s; R[:, 2, 0] = -s; R[:, 2, 2] = c
+            return R
+
+        # Base CoM
+        P_com_base = P_base + transf(R_base, self.c_base)
+        V_com_base = V_base + cross(W_base, P_com_base - P_base)
+
+        # Hip L (axis: -X)
+        P_hip_L = P_base + transf(R_base, self.p_hip_L)
+        R_hip_L = torch.bmm(R_base, rot_x(q[:, 0], -1.0))
+        W_hip_L = W_base + transf(R_base, torch.tensor([-1.,0.,0.], device=self.device).view(1,3) * dq[:, 0].unsqueeze(1))
+        V_hip_L = V_base + cross(W_base, P_hip_L - P_base)
+        P_com_hip_L = P_hip_L + transf(R_hip_L, self.c_hip_L)
+        V_com_hip_L = V_hip_L + cross(W_hip_L, P_com_hip_L - P_hip_L)
+
+        # Hip R (axis: -X)
+        P_hip_R = P_base + transf(R_base, self.p_hip_R)
+        R_hip_R = torch.bmm(R_base, rot_x(q[:, 1], -1.0))
+        W_hip_R = W_base + transf(R_base, torch.tensor([-1.,0.,0.], device=self.device).view(1,3) * dq[:, 1].unsqueeze(1))
+        V_hip_R = V_base + cross(W_base, P_hip_R - P_base)
+        P_com_hip_R = P_hip_R + transf(R_hip_R, self.c_hip_R)
+        V_com_hip_R = V_hip_R + cross(W_hip_R, P_com_hip_R - P_hip_R)
+
+        # Thigh L (axis: +Y)
+        P_thigh_L = P_hip_L + transf(R_hip_L, self.p_thigh_L)
+        R_thigh_L = torch.bmm(R_hip_L, rot_y(q[:, 2], 1.0))
+        W_thigh_L = W_hip_L + transf(R_hip_L, torch.tensor([0.,1.,0.], device=self.device).view(1,3) * dq[:, 2].unsqueeze(1))
+        V_thigh_L = V_hip_L + cross(W_hip_L, P_thigh_L - P_hip_L)
+        P_com_thigh_L = P_thigh_L + transf(R_thigh_L, self.c_thigh_L)
+        V_com_thigh_L = V_thigh_L + cross(W_thigh_L, P_com_thigh_L - P_thigh_L)
+
+        # Thigh R (axis: -Y)
+        P_thigh_R = P_hip_R + transf(R_hip_R, self.p_thigh_R)
+        R_thigh_R = torch.bmm(R_hip_R, rot_y(q[:, 3], -1.0))
+        W_thigh_R = W_hip_R + transf(R_hip_R, torch.tensor([0.,-1.,0.], device=self.device).view(1,3) * dq[:, 3].unsqueeze(1))
+        V_thigh_R = V_hip_R + cross(W_hip_R, P_thigh_R - P_hip_R)
+        P_com_thigh_R = P_thigh_R + transf(R_thigh_R, self.c_thigh_R)
+        V_com_thigh_R = V_thigh_R + cross(W_thigh_R, P_com_thigh_R - P_thigh_R)
+
+        # Calf L (axis: -Y)
+        P_calf_L = P_thigh_L + transf(R_thigh_L, self.p_calf_L)
+        R_calf_L = torch.bmm(R_thigh_L, rot_y(q[:, 4], -1.0))
+        W_calf_L = W_thigh_L + transf(R_thigh_L, torch.tensor([0.,-1.,0.], device=self.device).view(1,3) * dq[:, 4].unsqueeze(1))
+        V_calf_L = V_thigh_L + cross(W_thigh_L, P_calf_L - P_thigh_L)
+        P_com_calf_L = P_calf_L + transf(R_calf_L, self.c_calf_L)
+        V_com_calf_L = V_calf_L + cross(W_calf_L, P_com_calf_L - P_calf_L)
+
+        # Calf R (axis: +Y)
+        P_calf_R = P_thigh_R + transf(R_thigh_R, self.p_calf_R)
+        R_calf_R = torch.bmm(R_thigh_R, rot_y(q[:, 5], 1.0))
+        W_calf_R = W_thigh_R + transf(R_thigh_R, torch.tensor([0.,1.,0.], device=self.device).view(1,3) * dq[:, 5].unsqueeze(1))
+        V_calf_R = V_thigh_R + cross(W_thigh_R, P_calf_R - P_thigh_R)
+        P_com_calf_R = P_calf_R + transf(R_calf_R, self.c_calf_R)
+        V_com_calf_R = V_calf_R + cross(W_calf_R, P_com_calf_R - P_calf_R)
+
+        # Wheel Centers
+        P_wheel_L = P_calf_L + transf(R_calf_L, self.p_wheel_L)
+        V_wheel_L = V_calf_L + cross(W_calf_L, P_wheel_L - P_calf_L)
+        
+        P_wheel_R = P_calf_R + transf(R_calf_R, self.p_wheel_R)
+        V_wheel_R = V_calf_R + cross(W_calf_R, P_wheel_R - P_calf_R)
+
+        # 전체 질량 중심점 (바퀴 제외)
+        P_com_total = (self.m_base*P_com_base + self.m_hip*(P_com_hip_L + P_com_hip_R) + 
+                       self.m_thigh*(P_com_thigh_L + P_com_thigh_R) + self.m_calf*(P_com_calf_L + P_com_calf_R)) / self.M_total
+        V_com_total = (self.m_base*V_com_base + self.m_hip*(V_com_hip_L + V_com_hip_R) + 
+                       self.m_thigh*(V_com_thigh_L + V_com_thigh_R) + self.m_calf*(V_com_calf_L + V_com_calf_R)) / self.M_total
+
+        # 바퀴 평균 위치
+        P_wheel_avg = (P_wheel_L + P_wheel_R) / 2.0
+        V_wheel_avg = (V_wheel_L + V_wheel_R) / 2.0
+
+        # 상대 위치/속도를 이용해 역진자 파라미터 계산
+        P_rel = P_com_total - P_wheel_avg
+        V_rel = V_com_total - V_wheel_avg
+
+        theta = torch.atan2(P_rel[:, 0], P_rel[:, 2])
+        theta_dot = (V_rel[:, 0]*P_rel[:, 2] - V_rel[:, 2]*P_rel[:, 0]) / (P_rel[:, 0]**2 + P_rel[:, 2]**2 + 1e-6)
+        L = torch.sqrt(P_rel[:, 0]**2 + P_rel[:, 2]**2)
+
         return theta, theta_dot, L
 
 
@@ -153,17 +269,26 @@ class BalancePDController:
         self,
         joint_pos: torch.Tensor,
         joint_vel: torch.Tensor,
+        root_pos: torch.Tensor,
+        root_quat: torch.Tensor,
         body_pos: torch.Tensor,
         body_lin_vel: torch.Tensor,
-        link_mass: torch.Tensor,
+        root_lin_vel: torch.Tensor,
+        root_ang_vel: torch.Tensor,
         target_leg_pos: torch.Tensor,
         target_phi: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
 
         # 1. 상태 변수 추출 (MATLAB 변수명과 대응)
-        phi              = (joint_pos[:, self.wheel_indices[0]] - joint_pos[:, self.wheel_indices[1]]) / 2.0
+        raw_phi          = (joint_pos[:, self.wheel_indices[0]] - joint_pos[:, self.wheel_indices[1]]) / 2.0
+        if self.initial_phi is None:
+            self.initial_phi = raw_phi.clone()
+        phi              = raw_phi - self.initial_phi
         phi_dot          = (joint_vel[:, self.wheel_indices[0]] - joint_vel[:, self.wheel_indices[1]]) / 2.0
-        theta, theta_dot, L = self._COM_angle_cal(body_pos, body_lin_vel, link_mass)
+        theta, theta_dot, L = self._COM_angle_cal_FK(
+            root_pos, root_quat, root_lin_vel, root_ang_vel, 
+            joint_pos[:, self.leg_indices], joint_vel[:, self.leg_indices]
+        )
         r                = (body_pos[:, 7, 0] + body_pos[:, 8, 0]) / 2.0
         r_dot            = (body_lin_vel[:, 7, 0] + body_lin_vel[:, 8, 0]) / 2.0
 
@@ -251,9 +376,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         torque, debug_states = controller.compute_torque(
             joint_pos=robot.data.joint_pos,
             joint_vel=robot.data.joint_vel,
-            body_pos=robot.data.body_com_pos_w,
-            body_lin_vel=robot.data.body_lin_vel_w,
-            link_mass=link_mass,
+            root_pos=robot.data.root_pos_w,         
+            root_quat=robot.data.root_quat_w,
+            body_pos=robot.data.body_pos_w,
+            body_lin_vel=robot.data.body_lin_vel_w,       
+            root_lin_vel=robot.data.root_lin_vel_w, 
+            root_ang_vel=robot.data.root_ang_vel_w,
             target_leg_pos=default_joint_pos,
             target_phi=target_phi,
         )
